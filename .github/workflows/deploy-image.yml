@@ -39,11 +39,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          [[ "$TARGET_ENVIRONMENT" =~ ^(dev|stage|prod)$ ]] || {
+          [[ "$TARGET_ENVIRONMENT" =~ ^(dev|staging|prod)$ ]] || {
             echo "Unsupported cluster-config overlay: $TARGET_ENVIRONMENT" >&2
             exit 1
           }
-          [[ "$IMAGE_TAG" =~ ^sha-[0-9a-f]{40}$ ]] || {
+          [[ "$IMAGE_TAG" =~ ^${TARGET_ENVIRONMENT}-sha-[0-9a-f]{40}-run-[0-9]+-[0-9]+$ ]] || {
             echo "Refusing unexpected image tag: $IMAGE_TAG" >&2
             exit 1
           }

@@ -3,24 +3,13 @@ name: Build and push
 on:
   workflow_call:
     inputs:
+      target_environment:
+        required: true
+        type: string
       push:
-        description: Push the built image to GitHub Container Registry
         required: false
         type: boolean
         default: false
-      api-url:
-        description: Public API URL embedded in the Vite bundle
-        required: true
-        type: string
-      websocket-url:
-        description: Public WebSocket URL embedded in the Vite bundle
-        required: true
-        type: string
-      google-client-id:
-        description: Public Google OAuth client ID embedded in the Vite bundle
-        required: false
-        type: string
-        default: ""
     outputs:
       image:
         description: Fully qualified container image name
@@ -40,6 +29,8 @@ jobs:
   build:
     name: Container image
     runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.target_environment }}
     outputs:
       image: ${{ steps.image.outputs.name }}
       tag: ${{ steps.image.outputs.tag }}
@@ -51,9 +42,16 @@ jobs:
       - name: Define immutable image coordinates
         id: image
         shell: bash
+        env:
+          TARGET_ENVIRONMENT: ${{ inputs.target_environment }}
         run: |
+          [[ "$TARGET_ENVIRONMENT" =~ ^(dev|staging|prod)$ ]] || {
+            echo "Unsupported target environment: $TARGET_ENVIRONMENT" >&2
+            exit 1
+          }
+
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
-          tag="sha-${GITHUB_SHA}"
+          tag="${TARGET_ENVIRONMENT}-sha-${GITHUB_SHA}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           echo "name=$image" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
@@ -75,7 +73,22 @@ jobs:
           images: ${{ steps.image.outputs.name }}
           tags: |
             type=raw,value=${{ steps.image.outputs.tag }}
-            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+            type=raw,value=${{ inputs.target_environment }}
+            type=raw,value=latest,enable=${{ inputs.target_environment == 'prod' }}
+
+      - name: Validate environment build variables
+        shell: bash
+        env:
+          VITE_API_URL: ${{ vars.VITE_API_URL }}
+          VITE_WS_URL: ${{ vars.VITE_WS_URL }}
+          VITE_GOOGLE_CLIENT_ID: ${{ vars.VITE_GOOGLE_CLIENT_ID }}
+        run: |
+          for variable_name in VITE_API_URL VITE_WS_URL VITE_GOOGLE_CLIENT_ID; do
+            [[ -n "${!variable_name:-}" ]] || {
+              echo "GitHub environment variable $variable_name is not configured." >&2
+              exit 1
+            }
+          done
 
       - name: Build and optionally push image
         id: build
@@ -84,11 +97,11 @@ jobs:
           context: .
           platforms: linux/amd64
           build-args: |
-            VITE_API_URL=${{ vars.api-url }}
-            VITE_WS_URL=${{ vars.websocket-url }}
+            VITE_API_URL=${{ vars.VITE_API_URL }}
+            VITE_WS_URL=${{ vars.VITE_WS_URL }}
             VITE_REFRESH_INTERVAL_MS=240000
             VITE_REFRESH_SKEW_MS=60000
-            VITE_GOOGLE_CLIENT_ID=${{ vars.google-client-id }}
+            VITE_GOOGLE_CLIENT_ID=${{ vars.VITE_GOOGLE_CLIENT_ID }}
           push: ${{ inputs.push }}
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}

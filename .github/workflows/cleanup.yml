@@ -7,10 +7,19 @@ on:
         description: GitHub Container Registry package name
         required: true
         type: string
+      target-environment:
+        description: Environment prefix whose old images may be removed
+        required: true
+        type: string
       keep-tag:
         description: Exact tag identifying the newly built package version
         required: true
         type: string
+      retain-count:
+        description: Number of tagged image versions to retain for this environment
+        required: false
+        type: number
+        default: 3
 
 permissions:
   contents: read
@@ -32,15 +41,40 @@ jobs:
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
           PACKAGE_NAME: ${{ inputs.package-name }}
+          TARGET_ENVIRONMENT: ${{ inputs.target-environment }}
           KEEP_TAG: ${{ inputs.keep-tag }}
+          RETAIN_COUNT: ${{ inputs.retain-count }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const owner = context.repo.owner;
             const packageName = process.env.PACKAGE_NAME;
+            const targetEnvironment = process.env.TARGET_ENVIRONMENT;
             const keepTag = process.env.KEEP_TAG;
+            const retainCount = Number.parseInt(process.env.RETAIN_COUNT, 10);
             const ownerType = context.payload.repository?.owner?.type;
             const isOrganization = ownerType === "Organization";
+
+            if (!/^(dev|staging|prod)$/.test(targetEnvironment)) {
+              core.setFailed(`Unsupported target environment: ${targetEnvironment}`);
+              return;
+            }
+
+            if (!Number.isInteger(retainCount) || retainCount < 1 || retainCount > 20) {
+              core.setFailed(`retain-count must be an integer from 1 through 20; got ${process.env.RETAIN_COUNT}.`);
+              return;
+            }
+
+            const environmentTagPrefix = `${targetEnvironment}-sha-`;
+            const expectedKeepTag = new RegExp(
+              `^${targetEnvironment}-sha-[0-9a-f]{40}-run-[0-9]+-[0-9]+$`,
+            );
+            if (!expectedKeepTag.test(keepTag)) {
+              core.setFailed(
+                `Refusing keep tag ${keepTag}; expected an immutable ${targetEnvironment} build tag.`,
+              );
+              return;
+            }
 
             async function listVersions() {
               const endpoint = isOrganization
@@ -57,36 +91,53 @@ jobs:
             }
 
             let versions = [];
-            let keepers = [];
+            let currentVersions = [];
 
             // GHCR can take a few seconds to expose a freshly pushed version via the API.
             for (let attempt = 1; attempt <= 6; attempt += 1) {
               versions = await listVersions();
-              keepers = versions.filter((version) =>
+              currentVersions = versions.filter((version) =>
                 (version.metadata?.container?.tags ?? []).includes(keepTag),
               );
 
-              if (keepers.length === 1) break;
+              if (currentVersions.length === 1) break;
               if (attempt < 6) await new Promise((resolve) => setTimeout(resolve, 10000));
             }
 
-            if (keepers.length !== 1) {
+            if (currentVersions.length !== 1) {
               core.setFailed(
                 `Expected exactly one ${packageName} version tagged ${keepTag}; ` +
-                `found ${keepers.length}. No versions were deleted.`,
+                `found ${currentVersions.length}. No versions were deleted.`,
               );
               return;
             }
 
-            const keepVersionId = keepers[0].id;
+            const currentVersionId = currentVersions[0].id;
+            const environmentVersions = versions
+              .filter((version) =>
+                (version.metadata?.container?.tags ?? []).some((tag) =>
+                  tag.startsWith(environmentTagPrefix),
+                ),
+              )
+              .sort((left, right) =>
+                new Date(right.created_at).getTime() - new Date(left.created_at).getTime(),
+              );
+
+            // Always retain the freshly published version, even if GHCR returns
+            // versions in an unexpected order, then retain the newest rollback images.
+            const retainedVersionIds = new Set([currentVersionId]);
+            for (const version of environmentVersions) {
+              if (retainedVersionIds.size >= retainCount) break;
+              retainedVersionIds.add(version.id);
+            }
+
             // Buildx publishes an OCI index whose platform image and provenance
             // attestations are separate, untagged package versions. Deleting
             // those versions leaves the tagged index pointing at missing
-            // manifests, so cleanup must only target tagged root versions.
-            const obsoleteVersions = versions.filter(
-              (version) =>
-                version.id !== keepVersionId &&
-                (version.metadata?.container?.tags ?? []).length > 0,
+            // manifests, so cleanup only targets tagged roots belonging to the
+            // selected environment and never touches another environment.
+            const obsoleteVersions = environmentVersions.filter(
+              (version) => !retainedVersionIds.has(version.id),
             );
             const retainedUntaggedVersions = versions.filter(
               (version) => (version.metadata?.container?.tags ?? []).length === 0,
@@ -108,8 +159,9 @@ jobs:
             }
 
             core.info(
-              `Kept package version ${keepVersionId} tagged ${keepTag}; ` +
-              `deleted ${obsoleteVersions.length} older tagged version(s); ` +
+              `Kept ${retainedVersionIds.size} ${targetEnvironment} version(s), including ` +
+              `${currentVersionId} tagged ${keepTag}; deleted ${obsoleteVersions.length} older ` +
+              `${targetEnvironment} version(s); ` +
               `retained ${retainedUntaggedVersions.length} OCI child manifest(s).`,
             );
 

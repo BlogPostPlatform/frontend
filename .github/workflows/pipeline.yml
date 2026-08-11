@@ -2,18 +2,67 @@ name: Frontend pipeline
 
 on:
   push:
-    branches:
-      - main
+    branches: [dev, staging, main]
+
   pull_request:
-    branches:
-      - main
+    branches: [dev, staging, main]
   workflow_dispatch:
+    inputs:
+      target_environment:
+        description: Environment to rebuild
+        type: environment
+        required: true
 
 concurrency:
   group: frontend-pipeline-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  resolve-environment:
+    runs-on: ubuntu-latest
+    outputs:
+      target: ${{ steps.resolve.outputs.target }}
+    steps:
+      - id: resolve
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          BASE_REF: ${{ github.base_ref }}
+          MANUAL_TARGET: ${{ inputs.target_environment }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            target="$MANUAL_TARGET"
+
+            case "$REF_NAME:$target" in
+              dev:dev|staging:staging|main:prod) ;;
+              *)
+                echo "Branch $REF_NAME is not allowed to deploy to $target." >&2
+                exit 1
+                ;;
+            esac
+          else
+            branch="$REF_NAME"
+            [[ "$EVENT_NAME" == "pull_request" ]] && branch="$BASE_REF"
+
+            case "$branch" in
+              dev)     target="dev" ;;
+              staging) target="staging" ;;
+              main)    target="prod" ;;
+              *)
+                echo "Unsupported target branch: $branch" >&2
+                exit 1
+                ;;
+            esac
+          fi
+
+          [[ "$target" =~ ^(dev|staging|prod)$ ]] || {
+            echo "Unsupported target environment: $target" >&2
+            exit 1
+          }
+
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+
   verify:
     name: Verify
     permissions:
@@ -22,20 +71,20 @@ jobs:
 
   build:
     name: Build
-    needs: verify
+    needs:
+      - resolve-environment
+      - verify
     permissions:
       contents: read
       packages: write
     uses: ./.github/workflows/build-push.yml
     with:
-      push: ${{ github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
-      api-url: ${{ vars.VITE_API_URL || 'https://hojimatov.uz/api/' }}
-      websocket-url: ${{ vars.VITE_WS_URL || 'wss://hojimatov.uz/' }}
-      google-client-id: ${{ vars.VITE_GOOGLE_CLIENT_ID || '599757895161-gbh4flmim8hcgu1nca7n41qlsbj1gd6s.apps.googleusercontent.com' }}
+      target_environment: ${{ needs.resolve-environment.outputs.target }}
+      push: ${{ github.event_name != 'pull_request' }}
 
   image-scan:
     name: Scan published image
-    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    if: github.event_name != 'pull_request'
     needs: build
     permissions:
       contents: read
@@ -47,23 +96,25 @@ jobs:
 
   deploy:
     name: Deploy
-    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    if: github.event_name != 'pull_request'
     needs:
+      - resolve-environment
       - build
       - image-scan
     permissions:
       contents: read
     uses: ./.github/workflows/deploy-image.yml
     with:
-      target_environment: dev
+      target_environment: ${{ needs.resolve-environment.outputs.target }}
       tag: ${{ needs.build.outputs.tag }}
     secrets:
       CLUSTER_CONFIG_TOKEN: ${{ secrets.CLUSTER_CONFIG_TOKEN }}
 
   cleanup:
     name: Cleanup
-    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    if: github.event_name != 'pull_request'
     needs:
+      - resolve-environment
       - build
       - image-scan
       - deploy
@@ -73,4 +124,6 @@ jobs:
     uses: ./.github/workflows/cleanup.yml
     with:
       package-name: ${{ github.event.repository.name }}
+      target-environment: ${{ needs.resolve-environment.outputs.target }}
       keep-tag: ${{ needs.build.outputs.tag }}
+      retain-count: 3
