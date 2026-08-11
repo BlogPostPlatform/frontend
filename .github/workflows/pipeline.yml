@@ -1,0 +1,76 @@
+name: Frontend pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: frontend-pipeline-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify
+    permissions:
+      contents: read
+    uses: ./.github/workflows/verify.yml
+
+  build:
+    name: Build
+    needs: verify
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build-push.yml
+    with:
+      push: ${{ github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+      api-url: ${{ vars.VITE_API_URL || 'https://hojimatov.uz/api/' }}
+      websocket-url: ${{ vars.VITE_WS_URL || 'wss://hojimatov.uz/' }}
+      google-client-id: ${{ vars.VITE_GOOGLE_CLIENT_ID || '599757895161-gbh4flmim8hcgu1nca7n41qlsbj1gd6s.apps.googleusercontent.com' }}
+
+  image-scan:
+    name: Scan published image
+    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs: build
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/scan-image.yml
+    with:
+      image: ${{ needs.build.outputs.image }}
+      digest: ${{ needs.build.outputs.digest }}
+
+  deploy:
+    name: Deploy
+    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs:
+      - build
+      - image-scan
+    permissions:
+      contents: read
+    uses: ./.github/workflows/deploy-image.yml
+    with:
+      target_environment: dev
+      tag: ${{ needs.build.outputs.tag }}
+    secrets:
+      CLUSTER_CONFIG_TOKEN: ${{ secrets.CLUSTER_CONFIG_TOKEN }}
+
+  cleanup:
+    name: Cleanup
+    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs:
+      - build
+      - image-scan
+      - deploy
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/cleanup.yml
+    with:
+      package-name: ${{ github.event.repository.name }}
+      keep-tag: ${{ needs.build.outputs.tag }}

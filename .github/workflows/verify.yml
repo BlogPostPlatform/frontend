@@ -1,0 +1,76 @@
+name: Verify
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Production build and advisory lint
+    runs-on: ubuntu-latest
+    container:
+      image: node:20-alpine
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Lint source code
+        # The existing application has a legacy lint backlog. Keep findings
+        # visible without blocking deployments until that backlog is cleared.
+        continue-on-error: true
+        run: npm run lint
+
+      - name: Build production assets
+        run: npm run build
+
+  trivy:
+    name: Trivy source scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Scan dependencies and configuration
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig
+          severity: CRITICAL
+          ignore-unfixed: true
+          format: table
+          exit-code: "1"
+
+  semgrep:
+    name: Semgrep SAST
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:1.171.0
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Scan source code
+        run: semgrep scan --config auto --error .
+
+  secrets:
+    name: Gitleaks secret detection
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Scan Git history for secrets
+        run: |
+          docker run --rm \
+            --volume "$PWD:/repo:ro" \
+            --entrypoint /bin/sh \
+            ghcr.io/gitleaks/gitleaks@sha256:aa036a2f4bdfe3cc3c55fa4326308efabb4a6be498c883c864fd1d0d5585438a \
+            -c 'git config --global --add safe.directory /repo && gitleaks git --redact --verbose /repo'

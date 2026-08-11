@@ -1,0 +1,67 @@
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      target_environment:
+        description: Cluster-config overlay to update
+        required: true
+        type: string
+      tag:
+        description: Immutable image tag produced by the build job
+        required: true
+        type: string
+    secrets:
+      CLUSTER_CONFIG_TOKEN:
+        description: Fine-grained token with cluster-config contents write access
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Update ${{ inputs.target_environment }} image tag
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.target_environment }}
+    steps:
+      - name: Checkout cluster config
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ${{ github.repository_owner }}/cluster-config
+          ref: main
+          token: ${{ secrets.CLUSTER_CONFIG_TOKEN }}
+
+      - name: Update cluster-config overlay
+        env:
+          TARGET_ENVIRONMENT: ${{ inputs.target_environment }}
+          IMAGE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          [[ "$TARGET_ENVIRONMENT" =~ ^(dev|stage|prod)$ ]] || {
+            echo "Unsupported cluster-config overlay: $TARGET_ENVIRONMENT" >&2
+            exit 1
+          }
+          [[ "$IMAGE_TAG" =~ ^sha-[0-9a-f]{40}$ ]] || {
+            echo "Refusing unexpected image tag: $IMAGE_TAG" >&2
+            exit 1
+          }
+
+          file="frontend/overlays/$TARGET_ENVIRONMENT/kustomization.yaml"
+          if [[ $(grep -c 'name: frontend-image' "$file") -ne 1 || $(grep -c 'newTag:' "$file") -ne 1 ]]; then
+            echo "Expected exactly one frontend image and tag in $file" >&2
+            exit 1
+          fi
+          sed -i -E "s|^([[:space:]]*newTag:[[:space:]]*).*$|\\1$IMAGE_TAG|" "$file"
+
+          if git diff --quiet -- "$file"; then
+            echo "$file already references $IMAGE_TAG; no commit was created."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$file"
+          git commit -m "deploy(frontend): update $TARGET_ENVIRONMENT to $IMAGE_TAG"
+          git push origin main
